@@ -3,6 +3,9 @@ name: Build custom Gokapi images
 on:
   schedule:
     - cron: "17 3 * * *"
+  pull_request_target:
+    types: [closed]
+    branches: [master]
   workflow_dispatch:
     inputs:
       upstream_ref:
@@ -26,6 +29,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -39,22 +43,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_REF: ${{ inputs.upstream_ref }}
           TAG_MASTER: ${{ inputs.tag_master }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          if [[ -n "$INPUT_REF" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            ref="master"
+            source="fork"
+          elif [[ -n "$INPUT_REF" ]]; then
             ref="$INPUT_REF"
+            source="upstream"
           else
             ref="$(gh api repos/Forceu/Gokapi/releases/latest --jq '.tag_name')"
+            source="upstream"
           fi
 
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
 
           if [[ "$ref" == "master" ]]; then
             echo "mode=dev" >> "$GITHUB_OUTPUT"
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "tag_master=$TAG_MASTER" >> "$GITHUB_OUTPUT"
-            echo "Building upstream master as dev."
+            echo "Building $source master as dev."
             exit 0
           fi
 
@@ -112,17 +123,24 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch upstream source
+      - name: Fetch source code
         if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
         env:
           REF: ${{ steps.resolve.outputs.ref }}
+          SOURCE: ${{ steps.resolve.outputs.source }}
+          MERGE_COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
-          git clone https://github.com/Forceu/Gokapi.git upstream
-          git -C upstream checkout --detach "$REF"
+          if [[ "$SOURCE" == "fork" ]]; then
+            git clone "https://github.com/$GITHUB_REPOSITORY.git" upstream
+            git -C upstream checkout --detach "$MERGE_COMMIT"
+          else
+            git clone https://github.com/Forceu/Gokapi.git upstream
+            git -C upstream checkout --detach "$REF"
+          fi
 
       - name: Apply custom patch
-        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true' && steps.resolve.outputs.source == 'upstream'
         working-directory: upstream
         run: |
           set -euo pipefail
