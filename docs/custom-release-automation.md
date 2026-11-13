@@ -50,3 +50,21 @@ An upstream change can conflict with the patch. In that case the workflow fails 
 The upstream contribution is [Forceu/Gokapi#452](https://github.com/Forceu/Gokapi/pull/452) from `erathaowl:feature/upload-defaults-upstream`. Automation and README changes remain on the fork's `master` without changing that PR.
 
 Available settings: `GOKAPI_DEFAULT_DOWNLOADS` (default `1`) and `GOKAPI_DEFAULT_EXPIRY_DAYS` (default `14`), with `0` meaning unlimited.
+
+## Nightly synchronization with upstream master
+
+The separate [sync-upstream.yml](../.github/workflows/sync-upstream.yml) workflow runs every day at 02:43 UTC, before the release check at 03:17 UTC.
+
+- It fetches `Forceu/Gokapi:master` and checks whether its commits are already included in the fork's `master`.
+- When updates exist, it attempts a regular Git merge, preserving commit history.
+- `README.md` and the entire `.github/workflows/` directory always remain exactly as they were in the fork. This also excludes new upstream workflows instead of importing or enabling them.
+- Conflicts in these protected files are resolved by keeping the fork's version. Any other merge conflict stops synchronization without pushing.
+- A successful merge runs `go generate ./...` and `go test ./... -parallel 8 -count=1 -tags=test,noaws` before writing to `master`.
+- It pushes only when merging and testing succeed. GitHub Actions uses the built-in `GITHUB_TOKEN` with `contents: write`.
+- A failed run attempts to open a GitHub issue with a link to its logs.
+
+The synchronization workflow also supports a manual `workflow_dispatch` with `dry_run=true` by default. A dry run checks the merge and tests but does not push.
+
+Note: GitHub Actions pushes performed with the built-in `GITHUB_TOKEN` do not normally trigger new `push` workflows. Therefore a nightly sync does not automatically publish a new `dev` image; `custom-release.yml` still builds `dev` after a merged pull request or a manual master build.
+
+Repository branch protection or Actions workflow permissions may block direct pushes. If so, update the repository permissions or use a pull-request-based sync policy.
