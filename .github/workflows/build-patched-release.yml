@@ -1,0 +1,205 @@
+name: Build patched Gokapi releases
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Release tag (blank = latest); use master to validate against upstream development"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Build and test without pushing to GHCR"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patched-gokapi-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout customization files
+        uses: actions/checkout@v4
+        with:
+          path: customization
+
+      - name: Resolve upstream version
+        id: release
+        env:
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_REF" ]; then
+            ref="$REQUESTED_REF"
+          else
+            ref="$(curl -fsSL --retry 3 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/Forceu/Gokapi/releases/latest | jq -er '.tag_name')"
+          fi
+          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.]+)?$ && "$ref" != "master" ]]; then
+            echo "::error::Unsupported upstream ref: $ref"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream Gokapi
+        uses: actions/checkout@v4
+        with:
+          repository: Forceu/Gokapi
+          ref: ${{ steps.release.outputs.ref }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check upstream ancestry
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_base="34b54832a115f9a0bea495253f81d69d5c23bfe9"
+          if git -C upstream merge-base --is-ancestor "$patch_base" HEAD; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "Skipped: the selected release predates the patch base ($patch_base)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Select image and publication mode
+        id: plan
+        if: steps.baseline.outputs.eligible == 'true'
+        shell: bash
+        env:
+          REF: ${{ steps.release.outputs.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/$owner/gokapi" >> "$GITHUB_OUTPUT"
+          if [[ "$REF" == "master" || "$DRY_RUN" == "true" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.baseline.outputs.eligible == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to GHCR
+        if: steps.plan.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip already published releases
+        id: registry
+        if: steps.plan.outputs.publish == 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          REF: ${{ steps.release.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$REF-custom" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Skipped: $IMAGE:$REF-custom already exists." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply source patch
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --3way --check ../customization/patches/upload-defaults.patch
+          git apply --3way ../customization/patches/upload-defaults.patch
+          git diff --check
+          gofmt -w internal/environment/Environment_test.go internal/webserver/api/Api_test.go
+
+      - name: Set up Go
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache-dependency-path: upstream/go.sum
+
+      - name: Generate embedded assets
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        working-directory: upstream
+        run: go generate ./...
+
+      - name: Run Go tests
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        working-directory: upstream
+        run: go test ./... -tags=test,noaws -count=1
+
+      - name: Set up QEMU for ARM64
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build and optionally publish
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.plan.outputs.publish == 'true' }}
+          tags: ${{ steps.plan.outputs.image }}:${{ steps.release.outputs.ref }}-custom
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record result
+        if: steps.baseline.outputs.eligible == 'true' && steps.registry.outputs.exists != 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          REF: ${{ steps.release.outputs.ref }}
+          PUBLISH: ${{ steps.plan.outputs.publish }}
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            echo "Published $IMAGE:$REF-custom (amd64, arm64)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Validation completed for $REF without publishing." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  notify_failure:
+    needs: build
+    if: ${{ always() && needs.build.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create an issue for a failed release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="Custom Gokapi release build failed"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq '.[] | select(.title == "Custom Gokapi release build failed") | .number' | head -n 1)"
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Automatic patch/build failed. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
