@@ -1,0 +1,218 @@
+diff --git a/internal/environment/Environment.go b/internal/environment/Environment.go
+index 1a238a6a..26d169c7 100644
+--- a/internal/environment/Environment.go
++++ b/internal/environment/Environment.go
+@@ -34,6 +34,10 @@ type Environment struct {
+ 	DisableApiMenu bool `env:"DISABLE_API_MENU" envDefault:"false"`
+ 	// Disables the CORS check on startup and during setup, if set to true
+ 	DisableCorsCheck bool `env:"DISABLE_CORS_CHECK" envDefault:"false"`
++	// Default allowed downloads when an upload does not specify a limit (0 = unlimited)
++	DefaultDownloads int `env:"DEFAULT_DOWNLOADS" envDefault:"1" onlyPositive:"true"`
++	// Default file expiration in days when an upload does not specify it (0 = unlimited)
++	DefaultExpiryDays int `env:"DEFAULT_EXPIRY_DAYS" envDefault:"14" onlyPositive:"true"`
+ 	// Disables automatically adding Docker subnet to trusted proxies, if set to true
+ 	DisableDockerTrustedProxy bool `env:"DISABLE_DOCKER_TRUSTED_PROXY" envDefault:"false"`
+ 	// Sets the size of chunks that are uploaded in MB
+diff --git a/internal/environment/Environment_test.go b/internal/environment/Environment_test.go
+index 06ba9515..3f1a16aa 100644
+--- a/internal/environment/Environment_test.go
++++ b/internal/environment/Environment_test.go
+@@ -64,6 +64,26 @@ func TestEnvLoad(t *testing.T) {
+ 	os.Unsetenv("GOKAPI_MAX_FILESIZE")
+ }
+ 
++func TestDefaultUploadEnvironment(t *testing.T) {
++    t.Setenv("GOKAPI_DEFAULT_DOWNLOADS", "10")
++    t.Setenv("GOKAPI_DEFAULT_EXPIRY_DAYS", "30")
++    env := New()
++    test.IsEqualInt(t, env.DefaultDownloads, 10)
++    test.IsEqualInt(t, env.DefaultExpiryDays, 30)
++
++    t.Setenv("GOKAPI_DEFAULT_DOWNLOADS", "0")
++    t.Setenv("GOKAPI_DEFAULT_EXPIRY_DAYS", "0")
++    env = New()
++    test.IsEqualInt(t, env.DefaultDownloads, 0)
++    test.IsEqualInt(t, env.DefaultExpiryDays, 0)
++
++    t.Setenv("GOKAPI_DEFAULT_DOWNLOADS", "-1")
++    t.Setenv("GOKAPI_DEFAULT_EXPIRY_DAYS", "-1")
++    env = New()
++    test.IsEqualInt(t, env.DefaultDownloads, 1)
++    test.IsEqualInt(t, env.DefaultExpiryDays, 14)
++}
++
+ func TestIsAwsProvided(t *testing.T) {
+ 	os.Unsetenv("GOKAPI_AWS_BUCKET")
+ 	os.Unsetenv("GOKAPI_AWS_REGION")
+diff --git a/internal/webserver/Webserver.go b/internal/webserver/Webserver.go
+index fec0e7bb..fa4b53f7 100644
+--- a/internal/webserver/Webserver.go
++++ b/internal/webserver/Webserver.go
+@@ -781,6 +781,8 @@ type AdminView struct {
+ 	ActiveView            int
+ 	ChunkSize             int
+ 	MaxParallelUploads    int
++	DefaultDownloads      int
++	DefaultExpiryDays     int
+ 	MinLengthPassword     int
+ 	FileRequestMaxFiles   int
+ 	FileRequestMaxSize    int
+@@ -923,6 +925,8 @@ func (u *AdminView) convertGlobalConfig(view int, user models.User) *AdminView {
+ 	u.IsUserTabAvailable = config.Authentication.Method != models.AuthenticationDisabled
+ 	u.EndToEndEncryption = config.Encryption.Level == encryption.EndToEndEncryption
+ 	u.MaxParallelUploads = config.MaxParallelUploads
++	u.DefaultDownloads = configuration.GetEnvironment().DefaultDownloads
++	u.DefaultExpiryDays = configuration.GetEnvironment().DefaultExpiryDays
+ 	u.ChunkSize = config.ChunkSize
+ 	u.IncludeFilename = config.IncludeFilename
+ 	return u
+diff --git a/internal/webserver/api/Api_test.go b/internal/webserver/api/Api_test.go
+index 61f58434..79f352e2 100644
+--- a/internal/webserver/api/Api_test.go
++++ b/internal/webserver/api/Api_test.go
+@@ -1851,6 +1851,60 @@ func TestFilesDuplicateSanitisation(t *testing.T) {
+ 	test.IsEqualBool(t, strings.Contains(output.Name, "\n"), false)
+ }
+ 
++func TestChunkCompleteUploadDefaults(t *testing.T) {
++    env := configuration.GetEnvironment()
++    cases := []struct {
++        name               string
++        headers            map[string]bool
++        downloads          int
++        expiry             int
++        expectedDownloads  int
++        expectedExpiry     int
++        unlimitedDownloads bool
++        unlimitedTime      bool
++    }{
++        {
++            name: "omitted parameters",
++            headers: map[string]bool{},
++            expectedDownloads: env.DefaultDownloads,
++            expectedExpiry: env.DefaultExpiryDays,
++            unlimitedDownloads: env.DefaultDownloads == 0,
++            unlimitedTime: env.DefaultExpiryDays == 0 || env.DefaultExpiryDays > 100000,
++        },
++        {
++            name: "explicit unlimited",
++            headers: map[string]bool{"allowedDownloads": true, "expiryDays": true},
++            unlimitedDownloads: true,
++            unlimitedTime: true,
++        },
++        {
++            name: "explicit limits",
++            headers: map[string]bool{"allowedDownloads": true, "expiryDays": true},
++            downloads: 7,
++            expiry: 21,
++            expectedDownloads: 7,
++            expectedExpiry: 21,
++        },
++    }
++    for _, tc := range cases {
++        t.Run(tc.name, func(t *testing.T) {
++            p := &paramChunkComplete{
++                foundHeaders: tc.headers,
++                AllowedDownloads: tc.downloads,
++                ExpiryDays: tc.expiry,
++                FileSize: 10,
++                FileName: "test.txt",
++            }
++            err := p.ProcessParameter(nil)
++            test.IsNil(t, err)
++            test.IsEqualInt(t, p.AllowedDownloads, tc.expectedDownloads)
++            test.IsEqualInt(t, p.ExpiryDays, tc.expectedExpiry)
++            test.IsEqualBool(t, p.UnlimitedDownloads, tc.unlimitedDownloads)
++            test.IsEqualBool(t, p.UnlimitedTime, tc.unlimitedTime)
++        })
++    }
++}
++
+ func TestChunkCompleteSanitisationUnit(t *testing.T) {
+ 	p := &paramChunkComplete{}
+ 	p.foundHeaders = map[string]bool{"realsize": true}
+diff --git a/internal/webserver/api/routing.go b/internal/webserver/api/routing.go
+index 9f78793a..1b4a5798 100644
+--- a/internal/webserver/api/routing.go
++++ b/internal/webserver/api/routing.go
+@@ -9,6 +9,7 @@
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/forceu/gokapi/internal/configuration"
+ 	"github.com/forceu/gokapi/internal/helper"
+ 	"github.com/forceu/gokapi/internal/models"
+ 	"github.com/forceu/gokapi/internal/storage"
+@@ -702,7 +702,8 @@ func (p *paramChunkComplete) ProcessParameter(_ *http.Request) error {
+ 		if p.foundHeaders["allowedDownloads"] {
+ 			p.UnlimitedDownloads = true
+ 		} else {
+-			p.AllowedDownloads = 1
++			p.AllowedDownloads = configuration.GetEnvironment().DefaultDownloads
++			p.UnlimitedDownloads = p.AllowedDownloads == 0
+ 		}
+ 	}
+ 
+@@ -710,7 +711,8 @@ func (p *paramChunkComplete) ProcessParameter(_ *http.Request) error {
+ 		if p.foundHeaders["expiryDays"] {
+ 			p.UnlimitedTime = true
+ 		} else {
+-			p.ExpiryDays = 14
++			p.ExpiryDays = configuration.GetEnvironment().DefaultExpiryDays
++			p.UnlimitedTime = p.ExpiryDays == 0 || p.ExpiryDays > 100000
+ 		}
+ 	} else {
+ 		if p.ExpiryDays > 100000 {
+diff --git a/internal/webserver/fileupload/FileUpload.go b/internal/webserver/fileupload/FileUpload.go
+index bfd80293..20eb1bc2 100644
+--- a/internal/webserver/fileupload/FileUpload.go
++++ b/internal/webserver/fileupload/FileUpload.go
+@@ -157,11 +157,11 @@ func parseConfig(values formOrHeader) (models.UploadParameters, error) {
+ 	password := values.Get("password")
+ 	allowedDownloadsInt, err := strconv.Atoi(allowedDownloads)
+ 	if err != nil {
+-		allowedDownloadsInt = 1
++		allowedDownloadsInt = configuration.GetEnvironment().DefaultDownloads
+ 	}
+ 	expiryDaysInt, err := strconv.Atoi(expiryDays)
+ 	if err != nil {
+-		expiryDaysInt = 14
++		expiryDaysInt = configuration.GetEnvironment().DefaultExpiryDays
+ 	}
+ 
+ 	unlimitedDownload := values.Get("isUnlimitedDownload") == "true"
+diff --git a/internal/webserver/web/static/js/admin_ui_upload.js b/internal/webserver/web/static/js/admin_ui_upload.js
+index 4232afc3..6959ad95 100644
+--- a/internal/webserver/web/static/js/admin_ui_upload.js
++++ b/internal/webserver/web/static/js/admin_ui_upload.js
+@@ -136,12 +136,12 @@ function addFileProgress(file) {
+ }
+ 
+ 
+-function setUploadDefaults() {
+-    let defaultDownloads = getLocalStorageWithDefault("defaultDownloads", 1);
+-    let defaultExpiry = getLocalStorageWithDefault("defaultExpiry", 14);
++function setUploadDefaults(serverDownloads = 1, serverExpiry = 14) {
++    let defaultDownloads = getLocalStorageWithDefault("defaultDownloads", serverDownloads || 1);
++    let defaultExpiry = getLocalStorageWithDefault("defaultExpiry", serverExpiry || 14);
+     let defaultPassword = getLocalStorageWithDefault("defaultPassword", "");
+-    let defaultUnlimitedDownloads = getLocalStorageWithDefault("defaultUnlimitedDownloads", false) === "true";
+-    let defaultUnlimitedTime = getLocalStorageWithDefault("defaultUnlimitedTime", false) === "true";
++    let defaultUnlimitedDownloads = getLocalStorageWithDefault("defaultUnlimitedDownloads", String(serverDownloads === 0)) === "true";
++    let defaultUnlimitedTime = getLocalStorageWithDefault("defaultUnlimitedTime", String(serverExpiry === 0)) === "true";
+ 
+     document.getElementById("allowedDownloads").value = defaultDownloads;
+     document.getElementById("expiryDays").value = defaultExpiry;
+diff --git a/internal/webserver/web/templates/html_admin.tmpl b/internal/webserver/web/templates/html_admin.tmpl
+index ae4d9f9b..c1b6a8fe 100644
+--- a/internal/webserver/web/templates/html_admin.tmpl
++++ b/internal/webserver/web/templates/html_admin.tmpl
+@@ -204,7 +204,7 @@
+ 	registerChangeHandler();
+ 		
+ 	var canReplaceOwnFiles = {{.ActiveUser.HasPermissionReplace}};
+-	setUploadDefaults();
++	setUploadDefaults({{.DefaultDownloads}}, {{.DefaultExpiryDays}});
+ 	
+ {{ if .ShowDeprecationNotice }}
+ 	showDeprecationNotice();
