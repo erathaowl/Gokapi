@@ -50,10 +50,12 @@ This fork builds Gokapi from [upstream](https://github.com/Forceu/Gokapi), appli
 | `vX.Y.Z` | Exact upstream release | Once, when a compatible release is available |
 | `upstream` | Latest compatible upstream release | Automatically on new upstream releases |
 | `latest` | Same image as `upstream` | Automatically on new upstream releases |
-| `dev` | Current upstream `master` | On manual workflow runs |
+| `dev` | Current upstream `master` on manual builds, or the merged fork `master` commit after a PR merge | Manual workflow runs and merges into fork `master` |
 | `master` | Same image as `dev` | Only when enabled during a manual workflow run |
 
 The `dev` and optional `master` tags are development builds. Stable release images start with upstream `v2.2.5`, since the patch targets Gokapi 2.2.5-dev. GHCR tags become available after their first successful build and publication.
+
+Merging a pull request into this fork's `master` automatically rebuilds and publishes `dev` from the merged commit. This event does not update the optional `master` tag. Closing an unmerged PR does not publish an image.
 
 To build and publish from upstream `master`, open [Build custom Gokapi images](https://github.com/erathaowl/Gokapi/actions/workflows/custom-release.yml), select **Run workflow**, set **upstream_ref** to `master`, and optionally enable **tag_master**. Leave `upstream_ref` empty to check the latest upstream release.
 
