@@ -12,6 +12,8 @@ See [Build custom Gokapi images](../.github/workflows/custom-release.yml) or [ru
 - Upstream stable versions older than `v2.2.5` are skipped because the patch targets upstream Gokapi 2.2.5-dev.
 - Already-published stable version images are reused. The `upstream` and `latest` aliases are still updated when that version is the latest upstream release.
 - A manual `master` build always re-generates and publishes the `dev` image, regardless of previous runs.
+- When a pull request is merged into this fork's `master`, the workflow builds the merged commit from `erathaowl/Gokapi` and publishes `dev` automatically. It does not apply the patch again, because the source already contains the customization. Closing a PR without merging does not start a build.
+- Automatic PR-merge builds update only `dev`. The optional `master` tag is controlled exclusively by the manual `tag_master` input.
 - The workflow clones upstream, applies the patch with `git apply --3way`, generates assets, runs Go tests, builds AMD64 and ARM64 Linux binaries, then publishes a multi-platform image with Docker Buildx.
 - If the patch, tests, binary compilation, or publication fail, the workflow stops and attempts to open a GitHub issue.
 
@@ -23,6 +25,7 @@ See [Build custom Gokapi images](../.github/workflows/custom-release.yml) or [ru
 | Manual run for an older supported version | `ghcr.io/erathaowl/gokapi:vX.Y.Z` only |
 | Manual run with `upstream_ref=master` | `ghcr.io/erathaowl/gokapi:dev` |
 | Manual run with `upstream_ref=master`, `tag_master=true` | `ghcr.io/erathaowl/gokapi:dev`, `:master` |
+| Pull request merged into fork `master` | `ghcr.io/erathaowl/gokapi:dev` |
 
 The mobile tags `upstream` and `latest` point to the most recently published compatible upstream release. A failed release build does not move them. Existing versioned images are not rebuilt by default.
 
