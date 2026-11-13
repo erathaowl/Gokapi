@@ -11,6 +11,7 @@ See [Build custom Gokapi images](../.github/workflows/custom-release.yml) or [ru
 - Set the optional `tag_master` input to true when using `upstream_ref=master` to add the moving `master` Docker tag.
 - Upstream stable versions older than `v2.2.5` are skipped because the patch targets upstream Gokapi 2.2.5-dev.
 - Already-published stable version images are reused. The `upstream` and `latest` aliases are still updated when that version is the latest upstream release.
+- After a stable image is published (or an existing image is found), the workflow creates a GitHub Release if it does not exist yet.
 - A manual `master` build always re-generates and publishes the `dev` image, regardless of previous runs.
 - When a pull request is merged into this fork's `master`, the workflow builds the merged commit from `erathaowl/Gokapi` and publishes `dev` automatically. It does not apply the patch again, because the source already contains the customization. Closing a PR without merging does not start a build.
 - Automatic PR-merge builds update only `dev`. The optional `master` tag is controlled exclusively by the manual `tag_master` input.
@@ -27,7 +28,20 @@ See [Build custom Gokapi images](../.github/workflows/custom-release.yml) or [ru
 | Manual run with `upstream_ref=master`, `tag_master=true` | `ghcr.io/erathaowl/gokapi:dev`, `:master` |
 | Pull request merged into fork `master` | `ghcr.io/erathaowl/gokapi:dev` |
 
-The mobile tags `upstream` and `latest` point to the most recently published compatible upstream release. A failed release build does not move them. Existing versioned images are not rebuilt by default.
+The moving tags `upstream` and `latest` point to the latest compatible upstream release. A failed release build does not move them. Existing versioned images are not rebuilt by default.
+
+## GitHub Releases and exact source snapshots
+
+For each successfully published stable upstream version `vX.Y.Z`, the workflow creates a GitHub Release in this fork named `vX.Y.Z-custom`, linked to an annotated Git tag with the same name.
+
+- The workflow commits the applied patch and generated assets in an isolated checkout of the upstream release. The tag points to this patched source snapshot, not to the fork's moving `master` branch.
+- Release notes include the upstream release link, source commit SHA, GHCR image and digest, supported platforms, and configurable upload defaults.
+- Development builds triggered manually from `master` or by merging a pull request publish Docker images only; they never create GitHub Releases.
+- When the Docker tag already exists but the GitHub Release is absent, the workflow reconstructs and tags the patched snapshot and creates the missing Release without rebuilding the image.
+- Reruns leave existing GitHub Releases unchanged. If the target Git tag exists but its source tree differs from the newly prepared snapshot, the workflow fails instead of silently changing the tag.
+- Creating source tags and releases requires `contents: write` on the workflow's `GITHUB_TOKEN` and permission to push tags to the fork.
+
+Example: upstream `v2.2.5` produces `ghcr.io/erathaowl/gokapi:v2.2.5` and the fork release/tag `v2.2.5-custom`.
 
 ## Authentication
 
