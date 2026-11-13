@@ -1,0 +1,148 @@
+name: Synchronize upstream master
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate the upstream merge without pushing changes"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream changes
+        id: merge
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/Forceu/Gokapi.git
+          git fetch --no-tags upstream master
+
+          upstream_sha="$(git rev-parse upstream/master)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream master is already included in fork master." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-commit --no-ff upstream/master; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [[ -z "$conflicts" ]]; then
+              echo "::error::Git merge failed without reporting conflicting paths."
+              exit 1
+            fi
+
+            unresolved=0
+            while IFS= read -r path; do
+              case "$path" in
+                README.md|.github/workflows/*)
+                  echo "Keeping fork version of protected file: $path"
+                  ;;
+                *)
+                  echo "::error::Merge conflict requires attention: $path"
+                  echo "Merge conflict: $path" >> "$GITHUB_STEP_SUMMARY"
+                  unresolved=1
+                  ;;
+              esac
+            done <<< "$conflicts"
+
+            if [[ "$unresolved" -ne 0 ]]; then
+              git merge --abort
+              exit 1
+            fi
+          fi
+
+          # Keep fork documentation and workflow files unchanged.
+          # This also removes newly introduced upstream workflows.
+          git restore --source=HEAD --staged --worktree -- README.md .github/workflows
+
+          if [[ -n "$(git ls-files -u)" ]]; then
+            echo "::error::Unresolved merge entries remain."
+            git merge --abort
+            exit 1
+          fi
+
+          git diff --cached --check
+          echo "Upstream changes merged locally: $upstream_sha" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fork README and all existing workflows preserved; new upstream workflows excluded." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Go
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Generate assets and run tests
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          go generate ./...
+          go test ./... -parallel 8 -count=1 -tags=test,noaws
+
+      - name: Commit and push upstream merge
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          # Regeneration must not overwrite fork-only files.
+          git restore --source=HEAD --staged --worktree -- README.md .github/workflows
+          git add -u
+          git diff --cached --check
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN" == "true" ]]; then
+            echo "Dry run passed; no commit or push performed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -c core.hooksPath=/dev/null commit -m "Sync upstream master at $UPSTREAM_SHA"
+
+          gh auth setup-git
+          git push origin HEAD:master
+          echo "Pushed upstream merge to fork master." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report synchronization failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Automatic upstream master sync failed"
+
+          if ! gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+              --json title --jq '.[].title' | grep -Fxq "$title"; then
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body "The upstream master sync failed. No merge was pushed. See [the workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) for details."
+          fi
