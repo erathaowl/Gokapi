@@ -19,7 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   issues: write
 
@@ -123,8 +123,24 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check whether the GitHub Release exists
+        id: release_state
+        if: steps.resolve.outputs.mode == 'release' && steps.resolve.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if gh release view "$REF-custom" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Release already exists: $REF-custom"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub Release needs to be created: $REF-custom"
+          fi
+
       - name: Fetch source code
-        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.resolve.outputs.run == 'true' && (steps.existing.outputs.skip != 'true' || steps.release_state.outputs.missing == 'true')
         env:
           REF: ${{ steps.resolve.outputs.ref }}
           SOURCE: ${{ steps.resolve.outputs.source }}
@@ -140,26 +156,42 @@ jobs:
           fi
 
       - name: Apply custom patch
-        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true' && steps.resolve.outputs.source == 'upstream'
+        if: steps.resolve.outputs.run == 'true' && (steps.existing.outputs.skip != 'true' || steps.release_state.outputs.missing == 'true') && steps.resolve.outputs.source == 'upstream'
         working-directory: upstream
         run: |
           set -euo pipefail
           git apply --3way "$GITHUB_WORKSPACE/patches/upload-defaults.patch"
 
       - name: Set up Go
-        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.resolve.outputs.run == 'true' && (steps.existing.outputs.skip != 'true' || steps.release_state.outputs.missing == 'true')
         uses: actions/setup-go@v5
         with:
           go-version-file: upstream/go.mod
           cache-dependency-path: upstream/go.sum
 
       - name: Generate assets and run tests
-        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.resolve.outputs.run == 'true' && (steps.existing.outputs.skip != 'true' || steps.release_state.outputs.missing == 'true')
         working-directory: upstream
         run: |
           set -euo pipefail
           go generate ./...
           go test ./... -parallel 8 -count=1 -tags=test,noaws
+
+      - name: Prepare exact release source snapshot
+        if: steps.resolve.outputs.mode == 'release' && steps.release_state.outputs.missing == 'true'
+        working-directory: upstream
+        env:
+          REF: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m "Apply custom upload defaults to Gokapi $REF"
+          fi
+          echo "Prepared source snapshot at $(git rev-parse HEAD)"
 
       - name: Build Linux binaries
         if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
@@ -208,6 +240,67 @@ jobs:
             --tag "$IMAGE:upstream" \
             --tag "$IMAGE:latest" \
             "$IMAGE:$REF"
+
+      - name: Create source tag and GitHub Release
+        if: steps.resolve.outputs.mode == 'release' && steps.release_state.outputs.missing == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.resolve.outputs.ref }}
+          IMAGE: ${{ steps.existing.outputs.image }}
+          IS_LATEST: ${{ steps.resolve.outputs.latest }}
+        run: |
+          set -euo pipefail
+          release_tag="$REF-custom"
+
+          docker buildx imagetools inspect "$IMAGE:$REF" >/dev/null
+          gh auth setup-git
+          git -C upstream remote add fork "https://github.com/$GITHUB_REPOSITORY.git"
+
+          if git -C upstream ls-remote --exit-code --tags fork "refs/tags/$release_tag" >/dev/null 2>&1; then
+            git -C upstream fetch --no-tags fork "refs/tags/$release_tag:refs/tags/$release_tag"
+            tagged_tree="$(git -C upstream rev-parse "$release_tag^{tree}")"
+            source_tree="$(git -C upstream rev-parse "HEAD^{tree}")"
+            if [[ "$tagged_tree" != "$source_tree" ]]; then
+              echo "::error::Existing tag $release_tag points to different source contents."
+              exit 1
+            fi
+          else
+            git -C upstream tag -a "$release_tag" -m "Gokapi $REF with custom upload defaults"
+            git -C upstream push fork "refs/tags/$release_tag"
+          fi
+
+          source_commit="$(git -C upstream rev-parse "$release_tag^{commit}")"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$REF" | awk '/^Digest:/ {print $2; exit}')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Cannot read the published image digest."
+            exit 1
+          fi
+
+          {
+            echo "Gokapi $REF with configurable default upload limits."
+            echo
+            echo "- Upstream release: https://github.com/Forceu/Gokapi/releases/tag/$REF"
+            echo "- Patched source commit: $source_commit"
+            echo "- Docker image: ${IMAGE}:${REF}"
+            echo "- Docker digest: $digest"
+            echo "- Platforms: linux/amd64, linux/arm64"
+            echo "- Configuration: GOKAPI_DEFAULT_DOWNLOADS and GOKAPI_DEFAULT_EXPIRY_DAYS"
+            echo "- Patch: https://github.com/$GITHUB_REPOSITORY/blob/master/patches/upload-defaults.patch"
+          } > "$RUNNER_TEMP/release-notes.md"
+
+          latest_option="--latest=false"
+          if [[ "$IS_LATEST" == "true" ]]; then
+            latest_option="--latest"
+          fi
+
+          gh release create "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Gokapi $REF (custom)" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$latest_option"
+
+          echo "Created GitHub Release $release_tag from $source_commit" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report failed build
         if: ${{ failure() && steps.resolve.outputs.run == 'true' }}
