@@ -1,0 +1,20 @@
+FROM alpine:3.23
+
+ARG TARGETARCH
+
+RUN addgroup -S gokapi && adduser -S gokapi -G gokapi && \
+    apk add --no-cache su-exec tini ca-certificates curl tzdata && \
+    mkdir /app && touch /app/.isdocker
+
+COPY dockerentry.sh /app/run.sh
+COPY bin/gokapi-$TARGETARCH /app/gokapi
+
+RUN chmod +x /app/gokapi /app/run.sh
+
+WORKDIR /app
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/app/run.sh"]
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD curl --fail http://127.0.0.1:53842 || exit 1
