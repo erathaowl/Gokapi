@@ -1,4 +1,4 @@
-name: Build custom Gokapi releases
+name: Build custom Gokapi images
 
 on:
   schedule:
@@ -6,12 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream tag (vX.Y.Z) or master for validation; empty means latest release"
+        description: "Upstream tag (vX.Y.Z) or master for dev; leave empty for latest release"
         required: false
         type: string
-  push:
-    branches:
-      - automation/custom-release-build
+      tag_master:
+        description: "Also publish the master tag when building upstream master"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,7 +21,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: custom-gokapi-release
+  group: custom-gokapi-images
   cancel-in-progress: false
 
 jobs:
@@ -31,45 +33,45 @@ jobs:
       - name: Check out customizations
         uses: actions/checkout@v4
 
-      - name: Resolve upstream version
+      - name: Resolve upstream version and image tags
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_REF: ${{ inputs.upstream_ref }}
+          TAG_MASTER: ${{ inputs.tag_master }}
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            ref="master"
-          elif [[ -n "$INPUT_REF" ]]; then
+          if [[ -n "$INPUT_REF" ]]; then
             ref="$INPUT_REF"
           else
             ref="$(gh api repos/Forceu/Gokapi/releases/latest --jq '.tag_name')"
           fi
 
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
           if [[ "$ref" == "master" ]]; then
-            echo "ref=master" >> "$GITHUB_OUTPUT"
+            echo "mode=dev" >> "$GITHUB_OUTPUT"
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Validating current upstream master without publishing."
+            echo "tag_master=$TAG_MASTER" >> "$GITHUB_OUTPUT"
+            echo "Building upstream master as dev."
             exit 0
           fi
 
           if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Expected a stable tag such as v2.2.5, or master for validation."
+            echo "::error::Expected a stable upstream tag (vX.Y.Z) or master."
             exit 1
           fi
 
           if [[ "$(printf '%s\n' 'v2.2.5' "$ref" | sort -V | head -n 1)" != "v2.2.5" ]]; then
-            echo "Skipping $ref: patch targets Gokapi 2.2.5 and newer."
             echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping $ref: patch targets upstream v2.2.5 and newer."
             exit 0
           fi
 
           latest="$(gh api repos/Forceu/Gokapi/releases/latest --jq '.tag_name')"
+          echo "mode=release" >> "$GITHUB_OUTPUT"
           echo "run=true" >> "$GITHUB_OUTPUT"
-          echo "publish=true" >> "$GITHUB_OUTPUT"
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
           if [[ "$ref" == "$latest" ]]; then
             echo "latest=true" >> "$GITHUB_OUTPUT"
           else
@@ -77,33 +79,35 @@ jobs:
           fi
 
       - name: Set up QEMU
-        if: steps.resolve.outputs.publish == 'true'
+        if: steps.resolve.outputs.run == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.resolve.outputs.publish == 'true'
+        if: steps.resolve.outputs.run == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Authenticate to GHCR
-        if: steps.resolve.outputs.publish == 'true'
+        if: steps.resolve.outputs.run == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Skip images already published
+      - name: Check for an existing release image
         id: existing
-        if: steps.resolve.outputs.publish == 'true'
+        if: steps.resolve.outputs.run == 'true'
         env:
+          MODE: ${{ steps.resolve.outputs.mode }}
           REF: ${{ steps.resolve.outputs.ref }}
         run: |
           set -euo pipefail
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          if docker buildx imagetools inspect "$image:$REF-custom" >/dev/null 2>&1; then
+
+          if [[ "$MODE" == "release" ]] && docker buildx imagetools inspect "$image:$REF" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Image already published: $image:$REF-custom"
+            echo "Versioned image already exists: $image:$REF"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -152,16 +156,21 @@ jobs:
           done
 
       - name: Publish multi-platform image
-        if: steps.resolve.outputs.publish == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.resolve.outputs.run == 'true' && steps.existing.outputs.skip != 'true'
         env:
+          MODE: ${{ steps.resolve.outputs.mode }}
           REF: ${{ steps.resolve.outputs.ref }}
           IMAGE: ${{ steps.existing.outputs.image }}
-          IS_LATEST: ${{ steps.resolve.outputs.latest }}
+          TAG_MASTER: ${{ steps.resolve.outputs.tag_master }}
         run: |
           set -euo pipefail
-          tags=(--tag "$IMAGE:$REF-custom")
-          if [[ "$IS_LATEST" == "true" ]]; then
-            tags+=(--tag "$IMAGE:latest-custom")
+          if [[ "$MODE" == "dev" ]]; then
+            tags=(--tag "$IMAGE:dev")
+            if [[ "$TAG_MASTER" == "true" ]]; then
+              tags+=(--tag "$IMAGE:master")
+            fi
+          else
+            tags=(--tag "$IMAGE:$REF")
           fi
 
           docker buildx build \
@@ -170,8 +179,20 @@ jobs:
             "${tags[@]}" \
             --push upstream
 
-      - name: Report failed custom release
-        if: ${{ failure() && steps.resolve.outputs.publish == 'true' && steps.existing.outputs.skip != 'true' }}
+      - name: Update moving release tags
+        if: steps.resolve.outputs.run == 'true' && steps.resolve.outputs.mode == 'release' && steps.resolve.outputs.latest == 'true'
+        env:
+          REF: ${{ steps.resolve.outputs.ref }}
+          IMAGE: ${{ steps.existing.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$IMAGE:upstream" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE:$REF"
+
+      - name: Report failed build
+        if: ${{ failure() && steps.resolve.outputs.run == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ steps.resolve.outputs.ref }}
