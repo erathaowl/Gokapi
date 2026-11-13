@@ -1,31 +1,38 @@
 # Custom release automation
 
-This fork stores the upload defaults customization as a patch that is reapplied to upstream Gokapi releases.
+This fork keeps the upload defaults customization in `patches/upload-defaults.patch` and reapplies it to upstream Gokapi before compiling images.
 
 ## Workflow
 
-The automation is in [custom-release.yml](../.github/workflows/custom-release.yml).
+See [Build custom Gokapi images](../.github/workflows/custom-release.yml) or [run it in GitHub Actions](https://github.com/erathaowl/Gokapi/actions/workflows/custom-release.yml).
 
-- It runs daily at 03:17 UTC and checks the latest stable release of Forceu/Gokapi.
-- Manual runs accept a stable upstream tag, or `master` for validation without publishing.
-- A push to `automation/custom-release-build` validates the patch against upstream master without publishing.
-- Versions earlier than `v2.2.5` are skipped because the patch targets upstream 2.2.5-dev. The latest upstream release when this workflow was created was `v2.2.4`.
-- Published version tags are checked before rebuilding.
-- The workflow clones upstream, applies `patches/upload-defaults.patch`, runs `go generate ./...` and Go tests, then compiles Linux AMD64 and ARM64 binaries.
-- Docker Buildx publishes a multi-platform image to GitHub Container Registry only after successful checks.
-- Failed release builds stop before publication and attempt to create a GitHub issue. An existing open issue for the same version is reused.
+- A schedule checks for new upstream stable releases every day at 03:17 UTC.
+- `workflow_dispatch` supports `upstream_ref`: leave empty for the latest upstream release, enter a stable version such as `v2.2.5`, or enter `master` for a development image.
+- Set the optional `tag_master` input to true when using `upstream_ref=master` to add the moving `master` Docker tag.
+- Upstream stable versions older than `v2.2.5` are skipped because the patch targets upstream Gokapi 2.2.5-dev.
+- Already-published stable version images are reused. The `upstream` and `latest` aliases are still updated when that version is the latest upstream release.
+- A manual `master` build always re-generates and publishes the `dev` image, regardless of previous runs.
+- The workflow clones upstream, applies the patch with `git apply --3way`, generates assets, runs Go tests, builds AMD64 and ARM64 Linux binaries, then publishes a multi-platform image with Docker Buildx.
+- If the patch, tests, binary compilation, or publication fail, the workflow stops and attempts to open a GitHub issue.
 
-Image tags for an upstream `v2.2.5` release:
+## Docker image tags
 
-- `ghcr.io/erathaowl/gokapi:v2.2.5-custom`
-- `ghcr.io/erathaowl/gokapi:latest-custom` (only when v2.2.5 is the latest upstream release)
+| Trigger | Image tags |
+| --- | --- |
+| New compatible upstream release `vX.Y.Z` | `ghcr.io/erathaowl/gokapi:vX.Y.Z`, `:upstream`, `:latest` |
+| Manual run for an older supported version | `ghcr.io/erathaowl/gokapi:vX.Y.Z` only |
+| Manual run with `upstream_ref=master` | `ghcr.io/erathaowl/gokapi:dev` |
+| Manual run with `upstream_ref=master`, `tag_master=true` | `ghcr.io/erathaowl/gokapi:dev`, `:master` |
 
-GitHub Actions uses `GITHUB_TOKEN` with `packages: write` and `issues: write`. No external registry credentials are needed.
-Set the resulting GHCR package to public in GitHub package settings if unauthenticated pulls are required.
+The mobile tags `upstream` and `latest` point to the most recently published compatible upstream release. A failed release build does not move them. Existing versioned images are not rebuilt by default.
+
+## Authentication
+
+GitHub Actions uses `GITHUB_TOKEN` with `packages: write` and `issues: write`; Docker Hub credentials are not needed. To allow pulls without authentication, make the GitHub Container Registry package public after its first publication.
 
 ## Local verification
 
-From a full Git checkout of the relevant upstream release, apply the patch and run the tests:
+From a clean checkout of the relevant upstream commit or tag, apply the patch and run the tests:
 
 ```bash
 git apply --3way /path/to/Gokapi/patches/upload-defaults.patch
@@ -33,12 +40,10 @@ go generate ./...
 go test ./... -parallel 8 -count=1 -tags=test,noaws
 ```
 
-If an upstream change conflicts with the patch, the workflow fails and no image is published.
+An upstream change can conflict with the patch. In that case the workflow fails without publishing a new image; update and revalidate `patches/upload-defaults.patch`.
 
-## Branch separation
+## Upstream contribution
 
-Scheduled GitHub Actions workflows must be on the default branch. While this workflow remains on the automation branch, push events can validate it, but daily checks will start only after merging into `master`.
+The upstream contribution is [Forceu/Gokapi#452](https://github.com/Forceu/Gokapi/pull/452) from `erathaowl:feature/upload-defaults-upstream`. Automation and README changes remain on the fork's `master` without changing that PR.
 
-The automation is separate from the upstream contribution [Forceu/Gokapi#451](https://github.com/Forceu/Gokapi/pull/451), which currently uses `erathaowl:master` as its head. Merging this workflow into the fork's `master` while that PR is open would add unrelated workflow files to the upstream PR.
-
-Configuration variables remain `GOKAPI_DEFAULT_DOWNLOADS` (default `1`) and `GOKAPI_DEFAULT_EXPIRY_DAYS` (default `14`).
+Available settings: `GOKAPI_DEFAULT_DOWNLOADS` (default `1`) and `GOKAPI_DEFAULT_EXPIRY_DAYS` (default `14`), with `0` meaning unlimited.
