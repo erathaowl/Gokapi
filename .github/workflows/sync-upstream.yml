@@ -37,6 +37,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Git requires a committer identity before starting a merge.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git remote add upstream https://github.com/Forceu/Gokapi.git
           git fetch --no-tags upstream master
 
@@ -53,7 +57,10 @@ jobs:
           if ! git merge --no-commit --no-ff upstream/master; then
             conflicts="$(git diff --name-only --diff-filter=U)"
             if [[ -z "$conflicts" ]]; then
-              echo "::error::Git merge failed without reporting conflicting paths."
+              echo "::error::Git merge failed before reporting file conflicts. Review the Git error above."
+              if [[ -f .git/MERGE_HEAD ]]; then
+                git merge --abort
+              fi
               exit 1
             fi
 
@@ -124,8 +131,6 @@ jobs:
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -c core.hooksPath=/dev/null commit -m "Sync upstream master at $UPSTREAM_SHA"
 
           gh auth setup-git
@@ -139,10 +144,24 @@ jobs:
         run: |
           set -euo pipefail
           title="Automatic upstream master sync failed"
+          echo "Upstream synchronization failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
 
-          if ! gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-              --json title --jq '.[].title' | grep -Fxq "$title"; then
-            gh issue create --repo "$GITHUB_REPOSITORY" \
+          # GitHub Issues may be disabled in a fork.
+          if ! issues_enabled="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')"; then
+            echo "Could not check whether GitHub Issues are enabled." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$issues_enabled" != "true" ]]; then
+            echo "GitHub Issues are disabled; the failure is available in Actions." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json title \
+              --jq '.[].title' | grep -Fxq "$title"; then
+            if ! gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "$title" \
-              --body "The upstream master sync failed. No merge was pushed. See [the workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) for details."
+              --body "The upstream master sync failed. No merge was pushed. See [the workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) for details."; then
+              echo "Unable to open an issue; review the failed Actions run." >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
