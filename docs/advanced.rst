@@ -82,6 +82,10 @@ Available environment variables
 +-------------------------------------+----------------------------------------------------------------------------------------------------------+-----------------+-----------------------------+
 | GOKAPI_DATA_DIR                     | Sets the directory for the data                                                                          | Yes             | data                        |
 +-------------------------------------+----------------------------------------------------------------------------------------------------------+-----------------+-----------------------------+
+| GOKAPI_DEFAULT_DOWNLOADS            | Default allowed downloads when an upload does not specify a limit (0 = unlimited)                        | No              | 1                           |
++-------------------------------------+----------------------------------------------------------------------------------------------------------+-----------------+-----------------------------+
+| GOKAPI_DEFAULT_EXPIRY_DAYS          | Default file expiration in days when an upload does not specify it (0 = unlimited)                       | No              | 14                          |
++-------------------------------------+----------------------------------------------------------------------------------------------------------+-----------------+-----------------------------+
 | GOKAPI_DISABLE_API_MENU             | Disables the API menu and generation of API keys for non-admin users                                     | No              | false                       |
 +-------------------------------------+----------------------------------------------------------------------------------------------------------+-----------------+-----------------------------+
 | GOKAPI_DISABLE_CLOUDFLARE_DOWNLOAD  | Set this to true if you want to disable the automatic download of Cloudflare IP ranges and set the range | No              | false                       |
