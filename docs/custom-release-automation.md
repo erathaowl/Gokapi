@@ -73,6 +73,7 @@ The separate [sync-upstream.yml](../.github/workflows/sync-upstream.yml) workflo
 - When updates exist, it attempts a regular Git merge, preserving commit history.
 - `README.md` and the entire `.github/workflows/` directory always remain exactly as they were in the fork. This also excludes new upstream workflows instead of importing or enabling them.
 - Conflicts in these protected files are resolved by keeping the fork's version. Any other merge conflict stops synchronization without pushing.
+- Whitespace warnings inherited from upstream are reported without failing the merge; Go test failures and actual merge conflicts remain blocking.
 - A successful merge runs `go generate ./...` and `go test ./... -parallel 8 -count=1 -tags=test,noaws` before writing to `master`.
 - It pushes only when merging and testing succeed. GitHub Actions uses the built-in `GITHUB_TOKEN` with `contents: write`.
 - A failed run attempts to open a GitHub issue with a link to its logs.
