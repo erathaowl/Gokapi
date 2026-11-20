@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,6 +58,7 @@ func Process(w http.ResponseWriter, r *http.Request) {
 	err, user, apiKey, ok = isAuthorisedForApi(r, routing)
 	if err != nil {
 		sendError(w, http.StatusTooManyRequests, errorcodes.RateLimited, "Too many requests. Please wait a couple of minutes")
+		return
 	}
 	if !ok {
 		sendError(w, http.StatusUnauthorized, errorcodes.InvalidApiKey, "Unauthorized")
@@ -508,11 +510,23 @@ func apiChunkComplete(w http.ResponseWriter, r requestParser, user models.User, 
 		request.FileSize,
 		"")
 	if request.IsNonBlocking {
-		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
+		doNonBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
 		_, _ = io.WriteString(w, "{\"result\":\"OK\"}")
 		return
 	}
 	doBlockingPartCompleteChunk(w, request.Uuid, request.FileHeader, user, uploadParams)
+}
+
+func doNonBlockingPartCompleteChunk(w http.ResponseWriter, uuid string, fileHeader chunking.FileHeader, user models.User, uploadParameters models.UploadParameters) {
+	go func() {
+		defer func() {
+			rec := recover()
+			if rec != nil {
+				log.Printf("panic during chunk completion: %v", rec)
+			}
+		}()
+		doBlockingPartCompleteChunk(w, uuid, fileHeader, user, uploadParameters)
+	}()
 }
 
 func doBlockingPartCompleteChunk(w http.ResponseWriter, uuid string, fileHeader chunking.FileHeader, user models.User, uploadParameters models.UploadParameters) {
@@ -544,7 +558,7 @@ func apiChunkUploadRequestComplete(w http.ResponseWriter, r requestParser, user 
 		0, "", true, true,
 		false, request.FileSize, fileRequest.Id)
 	if request.IsNonBlocking {
-		go doBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
+		doNonBlockingPartCompleteChunk(nil, request.Uuid, request.FileHeader, user, uploadParams)
 		_, _ = io.WriteString(w, "{\"result\":\"OK\"}")
 		return
 	}
@@ -1288,10 +1302,13 @@ func apiURequestSave(w http.ResponseWriter, r requestParser, user models.User, _
 	_, _ = w.Write(result)
 }
 
-func apiUploadRequestList(w http.ResponseWriter, _ requestParser, user models.User, _ models.ApiKey) {
+func apiUploadRequestList(w http.ResponseWriter, _ requestParser, user models.User, apiKey models.ApiKey) {
 	userRequests := make([]models.FileRequest, 0)
 	for _, request := range filerequest.GetAll() {
 		if request.UserId == user.Id || user.HasPermission(models.UserPermListOtherUploads) {
+			if shouldRedactApiKey(request, user, apiKey) {
+				request.ApiKey = ""
+			}
 			userRequests = append(userRequests, request)
 		}
 	}
@@ -1300,7 +1317,18 @@ func apiUploadRequestList(w http.ResponseWriter, _ requestParser, user models.Us
 	_, _ = w.Write(result)
 }
 
-func apiUploadRequestListSingle(w http.ResponseWriter, r requestParser, user models.User, _ models.ApiKey) {
+// shouldRedactApiKey checks if the API key for public file requests should be blanked
+func shouldRedactApiKey(fileRequest models.FileRequest, user models.User, apiKey models.ApiKey) bool {
+	if !apiKey.HasPermission(models.ApiPermEdit) {
+		return true
+	}
+	if fileRequest.UserId != user.Id && !user.HasPermission(models.UserPermEditOtherUploads) {
+		return true
+	}
+	return false
+}
+
+func apiUploadRequestListSingle(w http.ResponseWriter, r requestParser, user models.User, apiKey models.ApiKey) {
 	request, ok := r.(*paramURequestListSingle)
 	if !ok {
 		panic("invalid parameter passed")
@@ -1314,6 +1342,9 @@ func apiUploadRequestListSingle(w http.ResponseWriter, r requestParser, user mod
 	if uploadRequest.UserId != user.Id && !user.HasPermission(models.UserPermListOtherUploads) {
 		sendError(w, http.StatusUnauthorized, errorcodes.NoPermission, "No permission to show this upload request")
 		return
+	}
+	if shouldRedactApiKey(uploadRequest, user, apiKey) {
+		uploadRequest.ApiKey = ""
 	}
 	result, err := json.Marshal(uploadRequest)
 	helper.Check(err)
